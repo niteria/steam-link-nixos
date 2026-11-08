@@ -1,0 +1,25 @@
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -1484,8 +1484,8 @@
+ 					corrected += hweight8((u8)~spare[i]);
+ 			if (corrected >= 48) {
+ 				mtd->ecc_stats.failed++;
+-				ret = -EBADMSG;
+-				goto out;
++				/* NAND core reports failed ECC with the full page retained. */
++				continue;
+ 			}
+ 			memset(buffer + chunk * 2048, 0xff, 2048);
+ 			if (chunk)
+@@ -2943,6 +2943,10 @@
+ 	 * MTD device becomes visible to readers. Boot page 0 is retained. */
+-	if (!ret)
++	if (!ret) {
++		u32 failed = mtd->ecc_stats.failed;
+ 		ret = berlin_read_page(chip, nand_get_data_buf(chip), 0);
++		if (ret >= 0 && mtd->ecc_stats.failed != failed)
++			ret = -EBADMSG;
++	}
+ 	nand_deselect_target(chip);
+ 	if (ret < 0) {
+ 		nand_cleanup(chip);

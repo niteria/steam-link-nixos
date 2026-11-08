@@ -1,0 +1,30 @@
+/dts-v1/;
+/plugin/;
+
+/ {
+	fragment@0 {
+		target-path = "/soc@f7000000";
+		__overlay__ {
+			#address-cells = <1>;
+			#size-cells = <1>;
+			nand-controller@f00000 {
+				compatible = "marvell,berlin2cd-nand-controller-ro";
+				reg = <0x00f00000 0x100>;
+				clocks = <&chip_clk 9>, <&chip_clk 34>;
+				clock-names = "core", "reg";
+				#address-cells = <1>;
+				#size-cells = <0>;
+				nand@0 {
+					reg = <0>;
+					nand-rb = <0>;
+					label = "steamlink-nand-ro";
+					nand-ecc-mode = "hw";
+					nand-ecc-step-size = <2048>;
+					nand-ecc-strength = <48>;
+					marvell,nand-keep-config;
+					read-only;
+				};
+			};
+		};
+	};
+};

@@ -1,0 +1,45 @@
+{
+  "nodes": {
+    "platform-nixpkgs": {
+      "locked": {
+        "lastModified": 1789921291,
+        "narHash": "sha256-Ft/BRnIqw1MywFoXydKobjjWmDFgDdYtSpJliE8+yUw=",
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "44a91898084f46797b5fac650c7e8c9ac38c43d4",
+        "type": "github"
+      },
+      "original": {
+        "owner": "NixOS",
+        "repo": "nixpkgs",
+        "rev": "44a91898084f46797b5fac650c7e8c9ac38c43d4",
+        "type": "github"
+      }
+    },
+    "root": {
+      "inputs": {
+        "platform-nixpkgs": "platform-nixpkgs",
+        "steamlink-reference": "steamlink-reference"
+      }
+    },
+    "steamlink-reference": {
+      "flake": false,
+      "locked": {
+        "lastModified": 1790096196,
+        "narHash": "sha256-PMfKY2zdzSjFzwBEbzhWsJ9/ov9mwbP2DRqk2xyElqs=",
+        "owner": "Ondra-Zik",
+        "repo": "steamlink-nixos",
+        "rev": "9734b750784c48b1d67b580b7086bd6d5eaa26f8",
+        "type": "github"
+      },
+      "original": {
+        "owner": "Ondra-Zik",
+        "repo": "steamlink-nixos",
+        "rev": "9734b750784c48b1d67b580b7086bd6d5eaa26f8",
+        "type": "github"
+      }
+    }
+  },
+  "root": "root",
+  "version": 7
+}

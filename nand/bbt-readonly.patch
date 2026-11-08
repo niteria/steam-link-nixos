@@ -1,0 +1,44 @@
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -1503,6 +1503,8 @@
+ 	return ret;
+ }
+ 
++#include "steamlink_bbt_readonly.h"
++
+ static int marvell_nfc_hw_ecc_bch_read_page(struct nand_chip *chip,
+ 					    u8 *buf, int oob_required,
+ 					    int page)
+@@ -2664,12 +2666,6 @@
+ 	return -EOPNOTSUPP;
+ }
+ 
+-static int steamlink_unavailable_badblock(struct mtd_info *mtd, loff_t offset)
+-{
+-	/* Factory marker/ROM BBT interpretation needs independent qualification. */
+-	return -EOPNOTSUPP;
+-}
+-
+ static int marvell_nand_attach_chip(struct nand_chip *chip)
+ {
+ 	struct mtd_info *mtd = nand_to_mtd(chip);
+@@ -2943,6 +2939,8 @@
+ 		if (ret >= 0 && mtd->ecc_stats.failed != failed)
+ 			ret = -EBADMSG;
+ 	}
++	if (ret >= 0)
++		ret = steamlink_import_stock_bbt(chip);
+ 	nand_deselect_target(chip);
+ 	if (ret < 0) {
+ 		nand_cleanup(chip);
+@@ -2951,8 +2949,8 @@
+ 		return ret;
+ 	}
+ 	mtd->flags &= ~MTD_WRITEABLE;
+-	mtd->_block_isbad = steamlink_unavailable_badblock;
+-	mtd->_block_isreserved = steamlink_unavailable_badblock;
++	mtd->_block_isbad = steamlink_readonly_block_isbad;
++	mtd->_block_isreserved = steamlink_readonly_block_isreserved;
+ 
+ 	if (pdata)
+ 		/* Legacy bindings support only one chip */

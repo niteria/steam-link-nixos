@@ -1,0 +1,399 @@
+diff --git a/drivers/mtd/nand/raw/marvell_nand.c b/drivers/mtd/nand/raw/marvell_nand.c
+index 38b7eb5..ed727ce 100644
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -90,6 +90,7 @@
+ #include <linux/dma-mapping.h>
+ #include <linux/dma/pxa-dma.h>
+ #include <linux/platform_data/mtd-nand-pxa3xx.h>
++#include "steamlink_readonly.h"
+ 
+ /* Data FIFO granularity, FIFO reads/writes must be a multiple of this length */
+ #define FIFO_DEPTH		8
+@@ -172,7 +173,7 @@
+ #define NDSR_UNCERR		BIT(4)
+ #define NDSR_CMDD(cs)		BIT(8 - cs)
+ #define NDSR_RDY(rb)		BIT(11 + rb)
+-#define NDSR_ERRCNT(x)		((x >> 16) & 0x1F)
++#define NDSR_ERRCNT(x)		((x >> 16) & 0xFF)
+ 
+ /* NAND ECC control register */
+ #define NDECCCTRL		0x28
+@@ -300,6 +301,8 @@ static const struct marvell_hw_ecc_layout marvell_nfc_layouts[] = {
+ 	MARVELL_LAYOUT( 8192,   512,  8,  9,  8, 1024,  0, 30,  0, 160, 30),
+ 	MARVELL_LAYOUT( 8192,   512,  12, 12, 11, 704,  0, 30,448,  64, 30),
+ 	MARVELL_LAYOUT( 8192,   512,  16, 17, 16, 512,  0, 30,  0,  32, 30),
++	/* Berlin programs the BCH strength instead of shrinking data chunks. */
++	MARVELL_LAYOUT( 4096,  2048,  48,  2,  1, 2048,  0, 90,2048, 32, 90),
+ };
+ 
+ /**
+@@ -386,6 +389,7 @@ struct marvell_nfc_caps {
+ 	bool is_nfcv2;
+ 	bool use_dma;
+ 	unsigned int max_mode_number;
++	bool is_berlin;
+ };
+ 
+ /**
+@@ -737,7 +741,7 @@ static int marvell_nfc_wait_op(struct nand_chip *chip, unsigned int timeout_ms)
+ 	if (!timeout_ms)
+ 		timeout_ms = IRQ_TIMEOUT;
+ 
+-	if (mtd->oops_panic_write) {
++	if (nfc->caps->is_berlin || mtd->oops_panic_write) {
+ 		ret = marvell_nfc_poll_status(nfc, NDSR_RDY(0),
+ 					      NDSR_RDY(0),
+ 					      timeout_ms);
+@@ -829,7 +833,9 @@ static void marvell_nfc_enable_hw_ecc(struct nand_chip *chip)
+ 		 * number of corrected bitflips.
+ 		 */
+ 		if (chip->ecc.algo == NAND_ECC_ALGO_BCH)
+-			writel_relaxed(NDECCCTRL_BCH_EN, nfc->regs + NDECCCTRL);
++			writel_relaxed(NDECCCTRL_BCH_EN |
++				       (nfc->caps->is_berlin ? 48U << 24 : 0),
++				       nfc->regs + NDECCCTRL);
+ 	}
+ }
+ 
+@@ -1370,6 +1376,133 @@ static void marvell_nfc_hw_ecc_bch_read_chunk(struct nand_chip *chip, int chunk,
+ 	}
+ }
+ 
++static int berlin_wait_status(struct marvell_nfc *nfc, u32 mask)
++{
++	u32 status;
++	int ret = readl_relaxed_poll_timeout_atomic(nfc->regs + NDSR, status,
++						status & mask, 1, POLL_TIMEOUT);
++	if (ret)
++		dev_err(nfc->dev, "Berlin timeout mask=%08x status=%08x ctrl=%08x\n",
++			mask, status, readl(nfc->regs + NDCR));
++	return ret;
++}
++
++static int berlin_send_read_command(struct marvell_nfc *nfc, u32 command,
++				   u32 address1, u32 address2, u32 length)
++{
++	int ret = berlin_wait_status(nfc, NDSR_WRCMDREQ);
++	if (ret)
++		return ret;
++	writel(NDSR_WRCMDREQ, nfc->regs + NDSR);
++	writel(command, nfc->regs + NDCB0);
++	writel(address1, nfc->regs + NDCB0);
++	writel(address2, nfc->regs + NDCB0);
++	if (command & NDCB0_LEN_OVRD)
++		writel(length, nfc->regs + NDCB0);
++	return 0;
++}
++
++static int berlin_read_fifo(struct marvell_nfc *nfc, u8 *buffer, unsigned int size)
++{
++	unsigned int offset;
++	int ret;
++	for (offset = 0; offset < size; offset += 32) {
++		ret = berlin_wait_status(nfc, NDSR_RDDREQ);
++		if (ret)
++			return ret;
++		writel(NDSR_RDDREQ, nfc->regs + NDSR);
++		ioread32_rep(nfc->regs + NDDB, buffer + offset, 8);
++	}
++	return 0;
++}
++
++static int berlin_read_page(struct nand_chip *chip, u8 *buffer, int page)
++{
++	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
++	struct mtd_info *mtd = nand_to_mtd(chip);
++	u32 status[2] = { 0 };
++	unsigned int chunk, i;
++	int ret, max_bitflips = 0;
++	u8 *spare = chip->oob_poi;
++	if (!buffer)
++		buffer = nand_get_data_buf(chip);
++	memset(spare, 0xff, mtd->oobsize);
++	marvell_nfc_select_target(chip, chip->cur_cs);
++	writel(0, nfc->regs + NDCR);
++	/* Match the stock start sequence: flush the stop before retuning BCH. */
++	readl(nfc->regs + NDECCCTRL);
++	writel(48U << 24, nfc->regs + NDECCCTRL);
++	readl(nfc->regs + NDECCCTRL);
++	writel((48U << 24) | NDECCCTRL_BCH_EN, nfc->regs + NDECCCTRL);
++	readl(nfc->regs + NDECCCTRL);
++	writel(0xffffffff, nfc->regs + NDSR);
++	/* Qualified stock settings: 4KiB page, 256 pages/block, 8-bit bus.
++	 * SPARE_EN stays clear; only the final data transfer includes 32 OOB bytes. */
++	writel(0x0106f000 | NDCR_ALL_INT | NDCR_ND_RUN | NDCR_ECC_EN,
++	       nfc->regs + NDCR);
++	ret = berlin_send_read_command(nfc, (6U << 29) | BIT(20) | NDCB0_DBC |
++				      NDCB0_ADDR_CYC(5) | 0x3000,
++				      (page & 0xffff) << 16, (page >> 16) & 0xff, 0);
++	if (ret)
++		goto out;
++	ret = berlin_wait_status(nfc, NDSR_RDY(0));
++	if (ret)
++		goto out;
++	writel(NDSR_RDY(0) | NDSR_CMDD(0), nfc->regs + NDSR);
++	for (chunk = 0; chunk < 2; chunk++) {
++		u32 command = (5U << 29) | NDCB0_LEN_OVRD;
++		if (!chunk)
++			command |= BIT(20);
++		ret = berlin_send_read_command(nfc, command, 0, 0,
++					      2048 + (chunk ? 32 : 0));
++		if (ret)
++			goto out;
++		ret = berlin_read_fifo(nfc, buffer + chunk * 2048, 2048);
++		if (ret)
++			goto out;
++		if (chunk) {
++			ret = berlin_read_fifo(nfc, spare, 32);
++			if (ret)
++				goto out;
++		}
++		status[chunk] = readl(nfc->regs + NDSR);
++		writel(NDSR_CORERR | NDSR_UNCERR, nfc->regs + NDSR);
++	}
++	ret = berlin_wait_status(nfc, NDSR_CMDD(0));
++	if (ret)
++		goto out;
++	for (chunk = 0; chunk < 2; chunk++) {
++		unsigned int corrected = 0;
++		if (status[chunk] & NDSR_UNCERR) {
++			/* Like the stock driver, accept a nearly erased chunk only
++			 * when data and its exposed spare have fewer than 48 zero bits. */
++			for (i = 0; i < 2048; i++)
++				corrected += hweight8((u8)~buffer[chunk * 2048 + i]);
++			if (chunk)
++				for (i = 0; i < 32; i++)
++					corrected += hweight8((u8)~spare[i]);
++			if (corrected >= 48) {
++				mtd->ecc_stats.failed++;
++				ret = -EBADMSG;
++				goto out;
++			}
++			memset(buffer + chunk * 2048, 0xff, 2048);
++			if (chunk)
++				memset(spare, 0xff, 32);
++		} else if (status[chunk] & NDSR_CORERR) {
++			corrected = NDSR_ERRCNT(status[chunk]);
++		}
++		mtd->ecc_stats.corrected += corrected;
++		max_bitflips = max_t(int, max_bitflips, corrected);
++	}
++	ret = max_bitflips;
++out:
++	writel(NDCR_ALL_INT, nfc->regs + NDCR);
++	writel(0xffffffff, nfc->regs + NDSR);
++	cond_resched();
++	return ret;
++}
++
+ static int marvell_nfc_hw_ecc_bch_read_page(struct nand_chip *chip,
+ 					    u8 *buf, int oob_required,
+ 					    int page)
+@@ -1382,6 +1515,9 @@ static int marvell_nfc_hw_ecc_bch_read_page(struct nand_chip *chip,
+ 	u32 failure_mask = 0;
+ 	int chunk, ret;
+ 
++	if (to_marvell_nfc(chip->controller)->caps->is_berlin)
++		return berlin_read_page(chip, buf, page);
++
+ 	marvell_nfc_select_target(chip, chip->cur_cs);
+ 
+ 	/*
+@@ -2183,6 +2319,18 @@ static int marvell_nfc_exec_op(struct nand_chip *chip,
+ 			       bool check_only)
+ {
+ 	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
++	unsigned int i;
++
++	/* Guard discovery as well as userspace I/O: no data-out, feature writes,
++	 * programming, erase, or bad-block-table update can pass this module. */
++	for (i = 0; i < op->ninstrs; i++) {
++		const struct nand_op_instr *instr = &op->instrs[i];
++		bool command = instr->type == NAND_OP_CMD_INSTR;
++		unsigned int opcode = command ? instr->ctx.cmd.opcode : 0;
++		if (!steamlink_readonly_instruction_allowed(
++			instr->type == NAND_OP_DATA_OUT_INSTR, command, opcode))
++			return check_only ? -EOPNOTSUPP : -EROFS;
++	}
+ 
+ 	if (!check_only)
+ 		marvell_nfc_select_target(chip, op->cs);
+@@ -2304,7 +2452,7 @@ static int marvell_nand_hw_ecc_controller_init(struct mtd_info *mtd,
+ 		ecc->write_oob = ecc->write_oob_raw;
+ 	} else {
+ 		chip->ecc.algo = NAND_ECC_ALGO_BCH;
+-		ecc->strength = 16;
++		ecc->strength = nfc->caps->is_berlin ? 48 : 16;
+ 		ecc->read_page_raw = marvell_nfc_hw_ecc_bch_read_page_raw;
+ 		ecc->read_page = marvell_nfc_hw_ecc_bch_read_page;
+ 		ecc->read_oob_raw = marvell_nfc_hw_ecc_bch_read_oob_raw;
+@@ -2493,6 +2641,34 @@ static int marvell_nfc_setup_interface(struct nand_chip *chip, int chipnr,
+ 	return 0;
+ }
+ 
++static int steamlink_blocked_write_page(struct nand_chip *chip,
++					const u8 *buf, int oob_required, int page)
++{
++	return -EROFS;
++}
++
++static int steamlink_blocked_write_oob(struct nand_chip *chip, int page)
++{
++	return -EROFS;
++}
++
++static int steamlink_unavailable_raw_page(struct nand_chip *chip,
++					u8 *buf, int oob_required, int page)
++{
++	return -EOPNOTSUPP;
++}
++
++static int steamlink_unavailable_raw_oob(struct nand_chip *chip, int page)
++{
++	return -EOPNOTSUPP;
++}
++
++static int steamlink_unavailable_badblock(struct mtd_info *mtd, loff_t offset)
++{
++	/* Factory marker/ROM BBT interpretation needs independent qualification. */
++	return -EOPNOTSUPP;
++}
++
+ static int marvell_nand_attach_chip(struct nand_chip *chip)
+ {
+ 	struct mtd_info *mtd = nand_to_mtd(chip);
+@@ -2501,6 +2677,15 @@ static int marvell_nand_attach_chip(struct nand_chip *chip)
+ 	struct pxa3xx_nand_platform_data *pdata = dev_get_platdata(nfc->dev);
+ 	int ret;
+ 
++	if (mtd->size != (1ULL << 32) || mtd->writesize != 4096 ||
++	    mtd->oobsize != 224 || mtd->erasesize != SZ_1M ||
++	    memcmp(chip->id.data, "\x2c\x68\x04\x4a\xa9", 5)) {
++		dev_err(nfc->dev, "Unqualified NAND identity/geometry; refusing probe\n");
++		return -ENODEV;
++	}
++	chip->options |= NAND_SKIP_BBTSCAN;
++	chip->bbt_options &= ~NAND_BBT_USE_FLASH;
++
+ 	if (pdata && pdata->flash_bbt)
+ 		chip->bbt_options |= NAND_BBT_USE_FLASH;
+ 
+@@ -2553,6 +2738,12 @@ static int marvell_nand_attach_chip(struct nand_chip *chip)
+ 		dev_err(nfc->dev, "ECC init failed: %d\n", ret);
+ 		return ret;
+ 	}
++	chip->ecc.write_page = steamlink_blocked_write_page;
++	chip->ecc.write_page_raw = steamlink_blocked_write_page;
++	chip->ecc.write_oob = steamlink_blocked_write_oob;
++	chip->ecc.write_oob_raw = steamlink_blocked_write_oob;
++	chip->ecc.read_page_raw = steamlink_unavailable_raw_page;
++	chip->ecc.read_oob_raw = steamlink_unavailable_raw_oob;
+ 
+ 	if (chip->ecc.engine_type == NAND_ECC_ENGINE_TYPE_ON_HOST) {
+ 		/*
+@@ -2739,6 +2930,25 @@ static int marvell_nand_chip_init(struct device *dev, struct marvell_nfc *nfc,
+ 		dev_err(dev, "could not scan the nand chip\n");
+ 		return ret;
+ 	}
++	/* Discovery uses several command types. Start normal PIO reads from a
++	 * completed chip reset instead of inheriting that command/FIFO state. */
++	nand_select_target(chip, 0);
++	ret = nand_reset_op(chip);
++	writel(NDCR_ALL_INT, nfc->regs + NDCR);
++	writel(0xffffffff, nfc->regs + NDSR);
++	/* A cold erased-page transfer can stall until a successful written-page
++	 * read establishes the Berlin BCH/FIFO state. Qualify that before the
++	 * MTD device becomes visible to readers. Boot page 0 is retained. */
++	if (!ret)
++		ret = berlin_read_page(chip, nand_get_data_buf(chip), 0);
++	nand_deselect_target(chip);
++	if (ret < 0) {
++		nand_cleanup(chip);
++		return ret;
++	}
++	mtd->flags &= ~MTD_WRITEABLE;
++	mtd->_block_isbad = steamlink_unavailable_badblock;
++	mtd->_block_isreserved = steamlink_unavailable_badblock;
+ 
+ 	if (pdata)
+ 		/* Legacy bindings support only one chip */
+@@ -2887,8 +3097,9 @@ static void marvell_nfc_reset(struct marvell_nfc *nfc)
+ 	 * SPARE_EN bit must always be set or ECC bytes will not be at the same
+ 	 * offset in the read page and this will fail the protection.
+ 	 */
+-	writel_relaxed(NDCR_ALL_INT | NDCR_ND_ARB_EN | NDCR_SPARE_EN |
+-		       NDCR_RD_ID_CNT(NFCV1_READID_LEN), nfc->regs + NDCR);
++	writel_relaxed(NDCR_ALL_INT | NDCR_ND_ARB_EN |
++		       GENMASK(14, 13) | /* 256 pages/block, as qualified by stock */
++		       NDCR_RD_ID_CNT(6), nfc->regs + NDCR);
+ 	writel_relaxed(0xFFFFFFFF, nfc->regs + NDSR);
+ 	writel_relaxed(0, nfc->regs + NDECCCTRL);
+ }
+@@ -2945,6 +3156,10 @@ static int marvell_nfc_probe(struct platform_device *pdev)
+ 		return -ENOMEM;
+ 
+ 	nfc->dev = dev;
++	nfc->caps = of_device_get_match_data(dev);
++	if (!of_machine_is_compatible("valve,steamlink") || !nfc->caps ||
++	    !nfc->caps->is_berlin)
++		return -ENODEV;
+ 	nand_controller_init(&nfc->controller);
+ 	nfc->controller.ops = &marvell_nand_controller_ops;
+ 	INIT_LIST_HEAD(&nfc->chips);
+@@ -2953,9 +3168,7 @@ static int marvell_nfc_probe(struct platform_device *pdev)
+ 	if (IS_ERR(nfc->regs))
+ 		return PTR_ERR(nfc->regs);
+ 
+-	irq = platform_get_irq(pdev, 0);
+-	if (irq < 0)
+-		return irq;
++	irq = 0; /* Berlin PIO has no direct NFC IRQ; DMA uses a separate dHub. */
+ 
+ 	nfc->core_clk = devm_clk_get(&pdev->dev, "core");
+ 
+@@ -2986,10 +3199,12 @@ static int marvell_nfc_probe(struct platform_device *pdev)
+ 
+ 	marvell_nfc_disable_int(nfc, NDCR_ALL_INT);
+ 	marvell_nfc_clear_int(nfc, NDCR_ALL_INT);
+-	ret = devm_request_irq(dev, irq, marvell_nfc_isr,
+-			       0, "marvell-nfc", nfc);
+-	if (ret)
+-		goto unprepare_reg_clk;
++	if (!nfc->caps->is_berlin) {
++		ret = devm_request_irq(dev, irq, marvell_nfc_isr,
++				       0, "marvell-nfc", nfc);
++		if (ret)
++			goto unprepare_reg_clk;
++	}
+ 
+ 	/* Get NAND controller capabilities */
+ 	if (pdev->id_entry)
+@@ -3144,7 +3359,18 @@ static const struct platform_device_id marvell_nfc_platform_ids[] = {
+ };
+ MODULE_DEVICE_TABLE(platform, marvell_nfc_platform_ids);
+ 
++static const struct marvell_nfc_caps berlin_readonly_caps = {
++	.max_cs_nb = 1,
++	.max_rb_nb = 1,
++	.is_nfcv2 = true,
++	.is_berlin = true,
++};
++
+ static const struct of_device_id marvell_nfc_of_ids[] = {
++	{
++		.compatible = "marvell,berlin2cd-nand-controller-ro",
++		.data = &berlin_readonly_caps,
++	},
+ 	{
+ 		.compatible = "marvell,armada-8k-nand-controller",
+ 		.data = &marvell_armada_8k_nfc_caps,
+@@ -3180,7 +3406,7 @@ MODULE_DEVICE_TABLE(of, marvell_nfc_of_ids);
+ 
+ static struct platform_driver marvell_nfc_driver = {
+ 	.driver	= {
+-		.name		= "marvell-nfc",
++		.name		= "steamlink-marvell-nfc-ro",
+ 		.of_match_table = marvell_nfc_of_ids,
+ 		.pm		= &marvell_nfc_pm_ops,
+ 	},

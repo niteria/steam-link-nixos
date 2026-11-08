@@ -1,0 +1,82 @@
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -1419,8 +1419,10 @@
++#include "steamlink_hardened_read.h"
++
+ static int berlin_read_page(struct nand_chip *chip, u8 *buffer, int page)
+ {
+ 	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
+-	struct mtd_info *mtd = nand_to_mtd(chip);
+ 	u32 status[2] = { 0 };
+-	unsigned int chunk, i;
+-	int ret, max_bitflips = 0;
++	unsigned int chunk;
++	int ret;
+ 	u8 *spare = chip->oob_poi;
++	if (slh_io.faulted) return -EIO;
+@@ -1416,16 +1417,9 @@
+ 		buffer = nand_get_data_buf(chip);
+-	memset(spare, 0xff, mtd->oobsize);
++	memset(spare, 0xff, nand_to_mtd(chip)->oobsize);
+ 	marvell_nfc_select_target(chip, chip->cur_cs);
+-	writel(0, nfc->regs + NDCR);
+-	/* Match the stock start sequence: flush the stop before retuning BCH. */
+-	readl(nfc->regs + NDECCCTRL);
+-	writel(48U << 24, nfc->regs + NDECCCTRL);
+-	readl(nfc->regs + NDECCCTRL);
+-	writel((48U << 24) | NDECCCTRL_BCH_EN, nfc->regs + NDECCCTRL);
+-	readl(nfc->regs + NDECCCTRL);
+-	writel(0xffffffff, nfc->regs + NDSR);
+ 	/* Qualified stock settings: 4KiB page, 256 pages/block, 8-bit bus.
+ 	 * SPARE_EN stays clear; only the final data transfer includes 32 OOB bytes. */
+-	writel(0x0106f000 | NDCR_ALL_INT | NDCR_ND_RUN | NDCR_ECC_EN,
+-	       nfc->regs + NDCR);
++	ret = slh_begin_bch(chip);
++	if (ret)
++		goto out;
+ 	ret = berlin_send_read_command(nfc, (6U << 29) | BIT(20) | NDCB0_DBC |
+@@ -1475,33 +1469,11 @@
+ 	if (ret)
+ 		goto out;
+-	for (chunk = 0; chunk < 2; chunk++) {
+-		unsigned int corrected = 0;
+-		if (status[chunk] & NDSR_UNCERR) {
+-			/* Like the stock driver, accept a nearly erased chunk only
+-			 * when data and its exposed spare have fewer than 48 zero bits. */
+-			for (i = 0; i < 2048; i++)
+-				corrected += hweight8((u8)~buffer[chunk * 2048 + i]);
+-			if (chunk)
+-				for (i = 0; i < 32; i++)
+-					corrected += hweight8((u8)~spare[i]);
+-			if (corrected >= 48) {
+-				mtd->ecc_stats.failed++;
+-				/* NAND core reports failed ECC with the full page retained. */
+-				continue;
+-			}
+-			memset(buffer + chunk * 2048, 0xff, 2048);
+-			if (chunk)
+-				memset(spare, 0xff, 32);
+-		} else if (status[chunk] & NDSR_CORERR) {
+-			corrected = NDSR_ERRCNT(status[chunk]);
+-		}
+-		mtd->ecc_stats.corrected += corrected;
+-		max_bitflips = max_t(int, max_bitflips, corrected);
+-	}
+-	ret = max_bitflips;
++	ret = slh_finish_read(chip, buffer, page, status);
+ out:
++	if (ret < 0)
++		slh_io.faulted = 1;
+-	writel(NDCR_ALL_INT, nfc->regs + NDCR);
+-	writel(0xffffffff, nfc->regs + NDSR);
++	if (slh_hw_stop(chip))
++		ret = -EIO;
+ 	cond_resched();
+ 	return ret;
+ }
+@@ -2677,1 +2647,1 @@
+-static int steamlink_unavailable_raw_page(struct nand_chip *chip,
++static int __maybe_unused steamlink_unavailable_raw_page(struct nand_chip *chip,
+@@ -2742,1 +2712,1 @@
+-	chip->ecc.read_page_raw = steamlink_unavailable_raw_page;
++	chip->ecc.read_page_raw = slh_raw_page;

@@ -1,0 +1,8 @@
+/result*
+/artifacts/
+/state/
+/private/
+__pycache__/
+*.py[cod]
+*.img
+*.img.zst

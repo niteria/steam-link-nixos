@@ -1,0 +1,10 @@
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -93,1 +93,3 @@
+ #include "steamlink_readonly.h"
++static int steamlink_hardened_fault_page = -1;
++module_param_named(fault_page, steamlink_hardened_fault_page, int, 0600);
+@@ -1470,1 +1472,3 @@
++	if (page == steamlink_hardened_fault_page)
++		status[0] |= NDSR_UNCERR;
+ 	ret = slh_finish_read(chip, buffer, page, status);

@@ -1,0 +1,11 @@
+/dts-v1/;
+/plugin/;
+/ {
+    fragment@0 {
+        target-path = "/soc@f7000000/apb@e80000/i2c@1400";
+        __overlay__ {
+            status = "okay";
+            clock-frequency = <400000>;
+        };
+    };
+};

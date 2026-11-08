@@ -1,0 +1,65 @@
+--- a/drivers/mtd/nand/raw/marvell_nand.c
++++ b/drivers/mtd/nand/raw/marvell_nand.c
+@@ -1503,6 +1503,7 @@
+ }
+ 
+ #include "steamlink_bbt_readonly.h"
++#include "steamlink_slc_trial.h"
+ 
+ static int marvell_nfc_hw_ecc_bch_read_page(struct nand_chip *chip,
+ 					    u8 *buf, int oob_required,
+@@ -2320,6 +2321,25 @@
+ 	struct marvell_nfc *nfc = to_marvell_nfc(chip->controller);
+ 	unsigned int i;
+ 
++	if (slc_is_erase_op(op)) {
++		unsigned int row = slc_erase_row(op);
++		if (!slc_armed() || !sl_trial_erase_allowed((u64)row << 12, 1048576))
++			return -EROFS;
++		return check_only ? 0 : slc_erase_page(chip, row);
++	}
++
++	if (slc_is_status_op(op)) {
++		int ret;
++		u8 status;
++		if (check_only)
++			return 0;
++		marvell_nfc_select_target(chip, op->cs);
++		ret = slc_read_status(nfc, &status);
++		if (!ret)
++			*(u8 *)op->instrs[1].ctx.data.buf.in = status;
++		return ret;
++	}
++
+ 	/* Guard discovery as well as userspace I/O: no data-out, feature writes,
+ 	 * programming, erase, or bad-block-table update can pass this module. */
+ 	for (i = 0; i < op->ninstrs; i++) {
+@@ -2741,6 +2749,6 @@
+ 		return ret;
+ 	}
+-	chip->ecc.write_page = steamlink_blocked_write_page;
++	chip->ecc.write_page = slc_write_page;
+ 	chip->ecc.write_page_raw = steamlink_blocked_write_page;
+ 	chip->ecc.write_oob = steamlink_blocked_write_oob;
+ 	chip->ecc.write_oob_raw = steamlink_blocked_write_oob;
+@@ -2950,6 +2958,12 @@
+ 	mtd->_block_isbad = steamlink_readonly_block_isbad;
+ 	mtd->_block_isreserved = steamlink_readonly_block_isreserved;
+
++	if (slc_armed())
++		mtd->flags |= MTD_WRITEABLE;
++	mtd->pairing = &slc_candidate_pairing;
++	mtd->_block_isbad = slc_block_isbad;
++	mtd->_block_markbad = slc_refuse_markbad;
++	chip->legacy.block_bad = slc_known_bad;
+ 	if (pdata)
+ 		/* Legacy bindings support only one chip */
+ 		ret = mtd_device_register(mtd, pdata->parts, pdata->nr_parts);
+@@ -2959,6 +2972,6 @@
+ 		ret = mtd_device_register(mtd, pdata->parts, pdata->nr_parts);
+ 	else
+-		ret = mtd_device_register(mtd, NULL, 0);
++		ret = mtd_device_register(mtd, slc_trial_parts, ARRAY_SIZE(slc_trial_parts));
+ 	if (ret) {
+ 		dev_err(dev, "Failed to register MTD device: %d\n", ret);
+ 		nand_cleanup(chip);
